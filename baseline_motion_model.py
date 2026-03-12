@@ -1,10 +1,10 @@
-﻿import argparse
+import argparse
 import json
 import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -242,6 +242,44 @@ def compute_target_norm_stats(dataset: Dataset) -> Tuple[torch.Tensor, torch.Ten
     return mean, std
 
 
+def load_split_samples(
+    single_annotations: str,
+    train_annotations: str,
+    val_annotations: str,
+    history: int,
+    synthetic_samples: int,
+) -> Tuple[List[MotionSample], Optional[List[MotionSample]]]:
+    """Load either a single annotation file or explicit train/val splits."""
+    if train_annotations and val_annotations:
+        train_path = Path(train_annotations)
+        val_path = Path(val_annotations)
+        if not train_path.exists():
+            raise FileNotFoundError(f"Train annotations file not found: {train_path}")
+        if not val_path.exists():
+            raise FileNotFoundError(f"Validation annotations file not found: {val_path}")
+
+        train_samples = parse_ovis_json(train_path, history=history)
+        val_samples = parse_ovis_json(val_path, history=history)
+        print(f"Loaded {len(train_samples)} train samples from {train_path}")
+        print(f"Loaded {len(val_samples)} val samples from {val_path}")
+        return train_samples, val_samples
+
+    if train_annotations or val_annotations:
+        raise ValueError("Provide both --train-annotations and --val-annotations together.")
+
+    if single_annotations:
+        ann_path = Path(single_annotations)
+        if not ann_path.exists():
+            raise FileNotFoundError(f"Annotations file not found: {ann_path}")
+        samples = parse_ovis_json(ann_path, history=history)
+        print(f"Loaded {len(samples)} samples from {ann_path}")
+        return samples, None
+
+    samples = make_synthetic_samples(synthetic_samples, history=history)
+    print(f"Using synthetic data with {len(samples)} samples")
+    return samples, None
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -320,6 +358,8 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Rudimentary motion baseline for OVIS-style VIS")
     parser.add_argument("--annotations", type=str, default="", help="Path to OVIS-style JSON annotations")
+    parser.add_argument("--train-annotations", type=str, default="", help="Path to training annotations JSON")
+    parser.add_argument("--val-annotations", type=str, default="", help="Path to validation annotations JSON")
     parser.add_argument("--history", type=int, default=5, help="Number of past frames used")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -332,34 +372,43 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.annotations:
-        ann_path = Path(args.annotations)
-        if not ann_path.exists():
-            raise FileNotFoundError(f"Annotations file not found: {ann_path}")
-        samples = parse_ovis_json(ann_path, history=args.history)
-        print(f"Loaded {len(samples)} samples from {ann_path}")
+    samples, val_samples = load_split_samples(
+        single_annotations=args.annotations,
+        train_annotations=args.train_annotations,
+        val_annotations=args.val_annotations,
+        history=args.history,
+        synthetic_samples=args.synthetic_samples,
+    )
+
+    if val_samples is not None:
+        train_set = MotionSequenceDataset(samples)
+        val_set = MotionSequenceDataset(val_samples)
+        if len(train_set) < 1 or len(val_set) < 1:
+            raise ValueError("Need at least 1 sample in both train and validation splits.")
     else:
-        samples = make_synthetic_samples(args.synthetic_samples, history=args.history)
-        print(f"Using synthetic data with {len(samples)} samples")
+        dataset = MotionSequenceDataset(samples)
+        n_samples = len(dataset)
+        if n_samples < 2:
+            raise ValueError("Need at least 2 samples for train/val split.")
 
-    dataset = MotionSequenceDataset(samples)
-    n_samples = len(dataset)
-    if n_samples < 2:
-        raise ValueError("Need at least 2 samples for train/val split.")
+        if n_samples < 50:
+            print(
+                "Warning: dataset is very small. Loss/metrics will be noisy and often large in pixel scale. "
+                "Generate a larger rudimentary JSON for more meaningful results."
+            )
 
-    if n_samples < 50:
+        train_len = max(1, int(0.9 * n_samples))
+        val_len = n_samples - train_len
+        if val_len == 0:
+            train_len = n_samples - 1
+            val_len = 1
+
+        train_set, val_set = random_split(dataset, [train_len, val_len])
+
+    if len(train_set) < 50:
         print(
-            "Warning: dataset is very small. Loss/metrics will be noisy and often large in pixel scale. "
-            "Generate a larger rudimentary JSON for more meaningful results."
+            "Warning: training split is very small. Loss/metrics will be noisy and often large in pixel scale."
         )
-
-    train_len = max(1, int(0.9 * n_samples))
-    val_len = n_samples - train_len
-    if val_len == 0:
-        train_len = n_samples - 1
-        val_len = 1
-
-    train_set, val_set = random_split(dataset, [train_len, val_len])
 
     x_mean, x_std = compute_input_norm_stats(train_set)
     y_mean, y_std = compute_target_norm_stats(train_set)
