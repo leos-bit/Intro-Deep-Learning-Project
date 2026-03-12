@@ -99,7 +99,12 @@ class MotionSequenceDataset(Dataset):
 def parse_ovis_json(annotation_file: Path, history: int) -> List[MotionSample]:
     # Accept both UTF-8 and UTF-8-with-BOM files (common on Windows).
     data = json.loads(annotation_file.read_text(encoding="utf-8-sig"))
-    annotations = data.get("annotations", [])
+    annotations = data.get("annotations")
+    if annotations is None:
+        raise ValueError(
+            f"Annotation file has no usable instance labels: {annotation_file}. "
+            "This split may contain hidden ground truth."
+        )
     samples: List[MotionSample] = []
 
     for ann in annotations:
@@ -149,7 +154,6 @@ def parse_ovis_json(annotation_file: Path, history: int) -> List[MotionSample]:
         raise ValueError("No valid training samples found in annotation file.")
 
     return samples
-
 
 def make_synthetic_samples(num_sequences: int, history: int) -> List[MotionSample]:
     samples: List[MotionSample] = []
@@ -429,6 +433,10 @@ def main() -> None:
     x_std = x_std.to(device)
     y_mean = y_mean.to(device)
     y_std = y_std.to(device)
+    best_val_iou = float("-inf")
+    best_epoch = None
+    out_path = Path(args.model_out)
+    last_out_path = out_path.with_name(f"{out_path.stem}_last{out_path.suffix}")
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, x_mean, x_std, y_mean, y_std, device)
@@ -438,7 +446,22 @@ def main() -> None:
             f"val_mse_px={val_mse:.4f} | val_center_l2_px={val_l2:.3f} | val_iou={val_iou:.3f}"
         )
 
-    out_path = Path(args.model_out)
+        if val_iou > best_val_iou:
+            best_val_iou = val_iou
+            best_epoch = epoch
+            payload = {
+                "model_state": model.state_dict(),
+                "feature_mean": x_mean.cpu(),
+                "feature_std": x_std.cpu(),
+                "target_mean": y_mean.cpu(),
+                "target_std": y_std.cpu(),
+                "history": args.history,
+                "best_val_iou": best_val_iou,
+                "best_epoch": best_epoch,
+            }
+            torch.save(payload, out_path)
+            print(f"Saved new best checkpoint at epoch {epoch:02d} to {out_path.resolve()}")
+
     payload = {
         "model_state": model.state_dict(),
         "feature_mean": x_mean.cpu(),
@@ -446,9 +469,11 @@ def main() -> None:
         "target_mean": y_mean.cpu(),
         "target_std": y_std.cpu(),
         "history": args.history,
+        "best_val_iou": best_val_iou,
+        "best_epoch": best_epoch,
     }
-    torch.save(payload, out_path)
-    print(f"Saved baseline model to {out_path.resolve()}")
+    torch.save(payload, last_out_path)
+    print(f"Saved last-epoch checkpoint to {last_out_path.resolve()}")
 
 
 if __name__ == "__main__":

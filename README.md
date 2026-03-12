@@ -34,8 +34,16 @@ python .\tools\make_rudimentary_ovis_json.py --out .\data\rudimentary_ovis_train
 
 ## Train Baseline
 
+Toy or single-file mode:
+
 ```powershell
 python .\baseline_motion_model.py --annotations .\data\rudimentary_ovis_train_big.json --history 5 --epochs 20
+```
+
+Real OVIS split-aware mode:
+
+```powershell
+python .\baseline_motion_model.py --train-annotations .\tools\annotations_train.json --val-annotations .\tools\annotations_valid.json --history 5 --epochs 20 --model-out .\baseline_motion_lstm_real.pt
 ```
 
 ## Output
