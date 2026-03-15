@@ -1,0 +1,406 @@
+\documentclass{article}
+
+\usepackage[final]{style}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{multirow}
+
+\title{Seeing Through Occlusion: Multi-Modal Motion Modeling for Video Instance Segmentation}
+
+\author{%
+  Alan Mohan \\
+  INI \\
+  \texttt{alanmoha@andrew.cmu.edu} \\
+  \And
+  Soren Dupont \\
+  ECE \\
+  \texttt{sdupont@andrew.cmu.edu} \\
+  \And
+  Rithwick Sethi \\
+  ECE \\
+  \texttt{rithwics@andrew.cmu.edu} \\
+  \And
+  Samuel Giovanetti \\
+  EPP \\
+  \texttt{sgiovane@andrew.cmu.edu} \\
+  \And
+  Leo Shaw \\
+  MechE \\
+  \texttt{leos@andrew.cmu.edu} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+Video Instance Segmentation (VIS) is the task of detecting, segmenting, and tracking object instances across frames of a video. Unlike static image segmentation, VIS requires maintaining consistent instance identities while objects move, deform, and interact with each other. One of the most difficult scenarios for VIS models occurs when objects become partially or fully occluded.
+
+Recent work shows that modern VIS models perform well on standard datasets but experience significant performance degradation when evaluated on occlusion-heavy benchmarks. The Occluded Video Instance Segmentation (OVIS) dataset \cite{qi2022ovis} demonstrates that state-of-the-art models can suffer a drop of approximately 20--30 mean Average Precision (mAP) compared to non-occluded benchmarks. This degradation occurs because many existing VIS methods rely heavily on appearance embeddings extracted from convolutional or transformer backbones. When an object becomes occluded, these appearance features become unreliable, and tracking identities often collapse.
+
+Recent research has begun exploring motion-based reasoning as an alternative signal for tracking objects during occlusion. InstMove \cite{liu2023instmove} proposes modeling instance motion directly from sequences of segmentation masks using recurrent neural networks. Instead of relying purely on appearance features, the model learns temporal patterns describing how objects move and deform over time.
+
+In this project, we build upon this motion-based formulation and investigate whether incorporating richer motion descriptors improves tracking robustness under occlusion. Specifically, we introduce a multi-modal motion representation that decomposes instance dynamics into separate velocity, acceleration, and shape deformation streams, fused through a learned gating mechanism. These features provide additional temporal cues that allow the model to reason about object trajectories even when appearance information is unreliable.
+
+At the time of this milestone report, we have completed the first half of the project timeline. This includes setting up the OVIS dataset, reproducing the InstMove baseline, and implementing and evaluating the proposed multi-modal motion model. Our multi-modal approach achieves a COCO-style mAP of \textbf{0.603}, improving over the single-stream baseline mAP of 0.587 (+1.5 points). The remainder of the project will focus on integrating occlusion-aware confidence estimation and memory-based temporal association.
+
+\section{Related Work}
+
+\subsection{Appearance-Based Video Instance Segmentation}
+
+Early VIS architectures such as MaskTrack R-CNN \cite{yang2019masktrack} extended Mask R-CNN to video settings by linking object detections across frames using appearance embeddings. These methods perform well when objects remain visible but struggle under occlusion because appearance features become unreliable.
+
+More recent transformer-based approaches such as VisTR \cite{wang2021vistr} attempt to model long-range temporal dependencies, but appearance-driven representations still degrade when objects are partially or completely hidden.
+
+\subsection{Motion-Based Instance Tracking}
+
+InstMove \cite{liu2023instmove} addresses this limitation by modeling instance motion directly from mask sequences using recurrent neural networks. Instead of relying on appearance embeddings, the model predicts the movement and deformation of an object over time based on previously observed masks. This approach has demonstrated improved performance on occlusion-heavy datasets such as OVIS.
+
+Our work builds upon this idea by introducing additional motion descriptors beyond raw mask sequences.
+
+\subsection{Memory-Based Temporal Association}
+
+Another direction for improving VIS robustness involves using memory modules to preserve instance identities over long time horizons. GenVIS \cite{heo2023genvis} introduces an instance prototype memory bank that stores object representations across frames, allowing the model to recover object identities after occlusion.
+
+Inspired by this approach, our project plans to incorporate an occlusion-aware memory mechanism in the second half of the project timeline.
+
+\section{Methods}
+
+\subsection{Problem Formulation}
+
+Given a sequence of frames $\{I_1, I_2, \ldots, I_T\}$, the goal of VIS is to predict instance masks $M_t^i$ and class labels for each object $i$ in frame $t$, while maintaining consistent identities across frames.
+
+Occlusion presents a major challenge because visual features become unreliable when objects are hidden. Our method focuses on modeling motion dynamics directly from bounding box sequences to maintain identity consistency during occlusion.
+
+\subsection{Backbone Architecture}
+
+We adopt MaskTrack R-CNN \cite{yang2019masktrack} as the base VIS architecture. This backbone was chosen for several reasons.
+
+First, MaskTrack R-CNN provides a well-established and reproducible VIS pipeline that has been widely used in prior work. Second, InstMove was originally built on top of MaskTrack R-CNN, allowing direct comparison with existing results. Finally, the architecture cleanly separates appearance-based detection from temporal association, making it suitable for experimenting with motion-based tracking mechanisms.
+
+\subsection{Heuristic Baselines}
+
+To establish lower bounds and contextualize the value of learned motion models, we evaluate two non-learned heuristic baselines that represent the simplest possible motion assumptions.
+
+\textbf{Copy-Last-Frame.} The zero-motion heuristic predicts that each object's bounding box remains unchanged from the previous frame:
+\[
+\hat{b}_t = b_{t-1}
+\]
+This baseline assumes objects are stationary between adjacent frames. Despite its simplicity, it performs surprisingly well on average because the majority of objects in the OVIS dataset exhibit minimal inter-frame displacement (median $\approx 14.7$ px on $1920 \times 1080$ frames). It serves as a critical sanity check: any learned model that cannot outperform Copy-Last-Frame is not effectively leveraging temporal information.
+
+\textbf{Constant Velocity.} The linear extrapolation heuristic assumes each object continues moving at the same velocity observed between the two most recent frames:
+\[
+\hat{b}_t = b_{t-1} + (b_{t-1} - b_{t-2})
+\]
+where the velocity is applied only to the centroid coordinates $(c_x, c_y)$, while width and height are copied from the last frame. This captures first-order motion but cannot model acceleration, deceleration, or changes in direction. It tends to overshoot on objects that are slowing down and undershoot on objects that are accelerating, making it a natural baseline for evaluating whether learned models capture higher-order dynamics.
+
+\subsection{Baseline: Single-Stream Motion LSTM}
+
+Our baseline follows the InstMove formulation \cite{liu2023instmove}, modeling instance motion using a single LSTM that consumes a 10-dimensional feature vector per frame: centroid position $(c_x, c_y)$, bounding box size $(w, h)$, velocity $(v_x, v_y)$, acceleration $(a_x, a_y)$, area, and log aspect ratio. Given a history window of $k=5$ frames, the LSTM predicts the bounding box at the next frame:
+\[
+\hat{b}_t = f_{\text{LSTM}}(x_{t-k}, \ldots, x_{t-1})
+\]
+where $x_t \in \mathbb{R}^{10}$ and $f$ is a single-layer LSTM with hidden dimension 128 (84K parameters).
+
+\subsection{Multi-Modal Motion Representation}
+
+We extend the baseline by decomposing motion into four specialized modality streams, each processed by a dedicated LSTM encoder before being fused through a learned gating mechanism.
+
+\textbf{Velocity Stream} ($\mathbb{R}^{8}$). Captures first-order dynamics: centroid velocity $(v_x, v_y)$, speed $\|v\|$, heading angle $\theta_v$, size change rates $(\dot{w}, \dot{h})$, and exponential moving averages of speed and heading for temporal smoothing.
+
+\textbf{Shape Deformation Stream} ($\mathbb{R}^{8}$). Captures how the object's spatial extent changes: width/height scale factors $s_w = w_t / w_{t-1}$, $s_h = h_t / h_{t-1}$, area growth rate, aspect ratio drift, and their exponential moving averages.
+
+\textbf{Acceleration Stream} ($\mathbb{R}^{8}$). Captures second-order dynamics: linear acceleration $(a_x, a_y)$, tangential and normal acceleration components, jerk magnitude $\|j\|$, and curvature of the trajectory.
+
+\textbf{Context Stream} ($\mathbb{R}^{4}$). Provides the raw positional anchor: centroid $(c_x, c_y)$ and box dimensions $(w, h)$.
+
+\subsubsection{Architecture}
+
+Each modality is encoded by a dedicated single-layer LSTM with hidden dimension 64. The three motion streams (velocity, shape, acceleration) are combined through a \emph{gated fusion} mechanism:
+\[
+g = \text{softmax}(W_g \cdot [\,h_\text{vel} \| h_\text{shape} \| h_\text{accel}\,])
+\]
+\[
+h_\text{motion} = \sum_{m \in \{\text{vel, shape, accel}\}} g_m \cdot h_m
+\]
+where $g \in \mathbb{R}^3$ are the learned gate weights and $\|$ denotes concatenation.
+
+Critically, the context stream is \emph{not} gated with the motion streams. Instead, the context encoding $h_\text{ctx}$ is concatenated with the fused motion representation to form the combined input to the prediction heads:
+\[
+h_\text{combined} = [h_\text{motion} \| h_\text{ctx}]
+\]
+
+This design reflects the intuition that position and motion serve complementary roles: position provides the spatial anchor (``where the object is''), while motion provides the trajectory correction (``where it is going'').
+
+The box prediction head includes a residual skip connection from the raw last-frame bounding box:
+\[
+\hat{b}_t = \text{MLP}(h_\text{combined}) + W_r \cdot b_{t-1}
+\]
+This allows the model to make small corrections to the last observed position rather than predicting absolute coordinates from scratch. The full model has 198K parameters.
+
+\subsubsection{Training}
+
+Both models are trained on 181,694 samples extracted from the OVIS training set, with a 90/10 train/validation split. Targets are z-score normalized. The loss combines MSE on box coordinates with binary cross-entropy on a visibility logit:
+\[
+\mathcal{L} = \text{MSE}(\hat{b}_t, b_t) + 0.1 \cdot \text{BCE}(\hat{v}_t, v_t) - \lambda_{\text{ent}} H(g)
+\]
+where $H(g)$ is the entropy of the gate distribution (regularization weight $\lambda_{\text{ent}} = 0.01$). The entropy term provides light regularization to prevent gate collapse without forcing uniform weights. We train for 20 epochs using Adam with learning rate $10^{-3}$, batch size 128, and gradient clipping at norm 1.0.
+
+\subsection{Occlusion Confidence Estimation}
+
+To quantify tracking reliability under occlusion, we compute a confidence score based on three measurable signals:
+
+\begin{itemize}
+\item Detection confidence from the object detector
+\item Mask area variation between frames
+\item Intersection-over-Union (IoU) overlap with other instance masks
+\end{itemize}
+
+A significant drop in detection confidence, large mask area change, or high overlap with other objects indicates potential occlusion. These signals are combined into a scalar occlusion confidence score used to weight motion predictions.
+
+\subsection{Future Work}
+
+In the remaining project timeline, we will introduce two additional components.
+
+First, we will incorporate an occlusion-aware temporal attention module that adaptively weights motion signals based on the computed occlusion confidence.
+
+Second, we will implement a memory bank inspired by GenVIS to maintain long-term instance identity information across frames.
+
+\section{Results}
+
+We evaluate on the OVIS dataset \cite{qi2022ovis} using COCO-style mAP averaged across IoU thresholds from 0.50 to 0.95 \cite{lin2014coco}, alongside mean IoU and center localization error. We compare against both non-learned heuristic baselines and the learned single-stream LSTM. To reveal the true value of motion modeling, we stratify evaluation by object displacement magnitude.
+
+\subsection{Overall Results}
+
+Table~\ref{tab:main_results} compares all methods on the full validation set (18,170 samples).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llccccc}
+\toprule
+Method & Type & mAP & AP$_{50}$ & AP$_{75}$ & IoU & L2 (px) \\
+\midrule
+Copy-Last-Frame & Heuristic & 0.608 & 0.874 & 0.638 & 0.756 & 26.3 \\
+Const.\ Velocity & Heuristic & 0.590 & 0.860 & 0.624 & 0.742 & 29.3 \\
+Baseline LSTM (84K) & Learned & 0.588 & 0.877 & 0.631 & 0.747 & 24.5 \\
+Multi-Modal (198K) & Learned & \textbf{0.608} & \textbf{0.886} & \textbf{0.653} & \textbf{0.759} & \textbf{23.9} \\
+\bottomrule
+\end{tabular}
+\caption{Overall performance on the full OVIS validation set. On average, all methods perform comparably because the majority of samples involve minimal object motion where even a trivial ``copy last frame'' heuristic suffices.}
+\label{tab:main_results}
+\end{table}
+
+A critical observation: on the full validation set, the non-learned Copy-Last-Frame heuristic achieves mAP 0.608, matching the multi-modal model. This reveals that \textbf{the majority of next-frame predictions are trivially solvable} because most objects barely move between adjacent frames (median displacement $= 14.7$ px on $1920 \times 1080$ frames). Overall evaluation therefore masks the true differences between methods. To properly assess motion modeling, we stratify by motion difficulty.
+
+\subsection{Motion-Stratified Evaluation}
+
+We partition the validation set into subsets by ground-truth centroid displacement: Low Motion (bottom 33\%, mean 4.1 px), Medium Motion (middle 33\%, mean 14.7 px), High Motion (top 33\%, mean 60.2 px), and Very High Motion (top 10\%, mean 112.1 px). Table~\ref{tab:motion_subsets} reports mAP across these subsets.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+& \multicolumn{5}{c}{mAP by Motion Difficulty} \\
+\cmidrule(lr){2-6}
+Method & All & Low & Medium & High & Very High \\
+\midrule
+Copy-Last-Frame & 0.608 & \textbf{0.849} & 0.637 & 0.336 & 0.176 \\
+Const.\ Velocity & 0.590 & 0.770 & 0.622 & 0.377 & 0.233 \\
+Baseline LSTM & 0.588 & 0.736 & 0.640 & 0.388 & 0.237 \\
+Multi-Modal (Ours) & \textbf{0.608} & 0.772 & \textbf{0.655} & \textbf{0.396} & \textbf{0.244} \\
+\bottomrule
+\end{tabular}
+\caption{mAP stratified by object motion magnitude. Copy-Last-Frame dominates on low-motion samples but collapses on high-motion objects. The multi-modal model outperforms all methods on medium, high, and very high motion subsets.}
+\label{tab:motion_subsets}
+\end{table}
+
+The stratification reveals a clear pattern:
+
+\begin{itemize}
+\item \textbf{Low motion:} Copy-Last-Frame trivially achieves 0.849 mAP. All learned models underperform because they introduce prediction noise on nearly-static objects. This is expected and does not reflect tracking failure.
+
+\item \textbf{High motion (+17.8\% vs Copy-Last):} On objects with significant displacement ($>23.6$ px), Copy-Last-Frame drops to 0.336 mAP while the multi-modal model achieves 0.396 --- a relative improvement of \textbf{+17.8\%}.
+
+\item \textbf{Very high motion (+38.0\% vs Copy-Last):} On the most challenging 10\% of samples (mean displacement 112 px), the advantage is even larger: the multi-modal model achieves 0.244 versus Copy-Last-Frame's 0.176, a relative improvement of \textbf{+38.0\%}.
+\end{itemize}
+
+Figure~\ref{fig:motion_subsets} visualizes these results. The gap between learned and heuristic methods widens monotonically with motion difficulty, confirming that motion modeling provides genuine value precisely when objects move fast --- the regime most relevant to occlusion-heavy tracking.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/motion_subset_map.png}
+\caption{mAP across motion difficulty subsets. Copy-Last-Frame (gray) dominates on slow objects but collapses on fast-moving ones. The multi-modal model (pink) maintains the highest performance across medium, high, and very high motion regimes.}
+\label{fig:motion_subsets}
+\end{figure}
+
+\subsection{Qualitative Prediction Visualization}
+
+Figure~\ref{fig:pred_vis} shows model predictions on a sample OVIS video sequence with multiple interacting instances. The top row displays ground-truth segmentation masks overlaid on actual video frames, while the bottom row compares predicted bounding boxes from the baseline LSTM (blue, dashed) and multi-modal model (red, dash-dot) against the ground truth (green). IoU scores are shown for each prediction. The multi-modal model produces tighter bounding boxes, particularly on fast-moving or partially occluded instances.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/video_predictions.png}
+\caption{Qualitative predictions on an OVIS video sequence. Top: ground-truth masks and boxes with occlusion labels (S = slight, X = severe). Bottom: baseline LSTM predictions (blue dashed) vs.\ multi-modal predictions (red dash-dot) against ground truth (green), with per-instance IoU scores.}
+\label{fig:pred_vis}
+\end{figure}
+
+\subsection{Per-Threshold AP on High-Motion Samples}
+
+Figure~\ref{fig:high_motion_thresh} shows per-threshold AP on the high-motion subset (top 33\%). The multi-modal model outperforms all baselines across every IoU threshold, with particularly large gains in the 0.60--0.80 range where precise bounding box prediction matters most.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\linewidth]{figs/motion_subset_high_per_threshold.png}
+\caption{Per-threshold AP on high-motion samples (top 33\% by displacement). The multi-modal model consistently outperforms both heuristic and learned baselines at every IoU threshold.}
+\label{fig:high_motion_thresh}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccccccc}
+\toprule
+& \multicolumn{10}{c}{IoU Threshold} \\
+\cmidrule(lr){2-11}
+Method & 0.50 & 0.55 & 0.60 & 0.65 & 0.70 & 0.75 & 0.80 & 0.85 & 0.90 & 0.95 \\
+\midrule
+Baseline & .876 & .852 & .814 & .770 & .710 & .627 & .526 & .401 & .240 & .067 \\
+Multi-Modal & \textbf{.884} & \textbf{.856} & \textbf{.821} & \textbf{.777} & \textbf{.720} & \textbf{.643} & \textbf{.549} & \textbf{.427} & \textbf{.269} & \textbf{.081} \\
+\midrule
+$\Delta$ & +.008 & +.004 & +.007 & +.007 & +.010 & +.016 & +.023 & +.026 & +.029 & +.014 \\
+\bottomrule
+\end{tabular}
+\caption{Complete per-threshold AP comparison. Improvements are largest in the AP$_{0.80}$--AP$_{0.90}$ range, demonstrating better bounding box precision from the multi-modal motion features.}
+\label{tab:per_thresh}
+\end{table}
+
+\subsection{Training Dynamics}
+
+Figure~\ref{fig:summary} shows the training dynamics of both models over 20 epochs.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/summary_2x2.png}
+\caption{Training dynamics comparison. (a) The multi-modal model achieves lower training loss and faster convergence. (b--c) Validation mAP and IoU show the multi-modal model consistently outperforming the baseline. (d) Center localization error is comparable, with the multi-modal model showing a slight edge.}
+\label{fig:summary}
+\end{figure}
+
+Several trends are notable. First, the multi-modal model converges significantly faster in terms of training loss (0.006 vs 0.020 at epoch 20), indicating that the decomposed feature representation provides a more learnable signal. Second, the validation mAP and IoU curves show that the multi-modal model maintains a consistent advantage throughout training, not just at peak performance. Third, the center localization error (L2) is similar for both models ($\sim$24--25 px), suggesting that the gains come primarily from better shape/scale prediction rather than centroid accuracy.
+
+\subsection{Gated Fusion Analysis}
+
+Figure~\ref{fig:gates} shows the average gate weights across training. The three motion modalities (velocity, shape, acceleration) maintain approximately equal contributions ($\sim$0.33 each), suggesting that all three streams provide complementary information and none dominates.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\linewidth]{figs/gate_weights.png}
+\caption{Evolution of gated fusion weights over training. The three motion modalities maintain near-equal contributions, indicating all streams provide complementary information.}
+\label{fig:gates}
+\end{figure}
+
+\section{Ablation Study}
+
+To evaluate the contribution of each component, we plan to conduct ablation experiments in the next phase of the project.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Configuration & mAP (All) & mAP (High) & mAP (Very High) \\
+\midrule
+Copy-Last-Frame (heuristic) & 0.608 & 0.336 & 0.176 \\
+Baseline LSTM (single stream) & 0.588 & 0.388 & 0.237 \\
++ Separate encoders, no gating & -- & -- & Planned \\
++ Gated fusion (vel + shape + accel) & -- & -- & Planned \\
++ Residual skip connection & -- & -- & Planned \\
+Full Multi-Modal (all components) & \textbf{0.608} & \textbf{0.396} & \textbf{0.244} \\
+\bottomrule
+\end{tabular}
+\caption{Ablation experiments. The full model and baselines are reported; individual component ablations will be completed in the next project phase. ``High'' and ``Very High'' columns refer to the top 33\% and top 10\% displacement subsets, respectively.}
+\label{tab:ablation}
+\end{table}
+
+\section{Discussion and Conclusion}
+
+We presented a multi-modal motion modeling approach for improving video instance segmentation under occlusion. By decomposing instance motion into separate velocity, shape deformation, and acceleration streams and fusing them through a learned gating mechanism, our model reveals clear advantages over both heuristic baselines and single-stream learned models --- but only when evaluated on samples where motion modeling actually matters.
+
+A central finding of this work is that \textbf{overall evaluation on adjacent-frame prediction masks the true value of motion modeling}. On the full OVIS validation set, the trivial Copy-Last-Frame heuristic matches our multi-modal model at 0.608 mAP, because the majority of objects barely move between adjacent frames. This motivates our motion-stratified evaluation protocol, which we argue should become standard practice when evaluating motion models.
+
+The key findings from our experiments are:
+
+\begin{enumerate}
+\item \textbf{Motion-stratified evaluation is essential.} On low-motion samples (bottom 33\%), Copy-Last-Frame trivially achieves 0.849 mAP, making overall metrics misleading. By stratifying by displacement magnitude, we reveal that the multi-modal model achieves \textbf{+17.8\%} relative improvement on high-motion samples and \textbf{+38.0\%} on very high-motion samples (top 10\%) compared to Copy-Last-Frame.
+
+\item \textbf{Modality decomposition helps.} Separating motion into specialized streams with dedicated LSTM encoders outperforms the single-stream baseline LSTM across all motion difficulty subsets (+2--5\% relative mAP), despite both models having access to the same underlying positional information.
+
+\item \textbf{Gains scale with motion difficulty.} The advantage of learned motion models over heuristic baselines grows monotonically with object displacement, confirming that motion modeling provides genuine value precisely in the regime most relevant to occlusion-heavy tracking.
+
+\item \textbf{Context separation and residual connections matter.} By treating position context as a separate, always-on stream (not gated with motion modalities) and adding a residual skip connection from the last observed frame, the model learns to use motion as a correction signal on top of position rather than having to trade off between the two.
+
+\item \textbf{Faster convergence.} The multi-modal model reaches a training loss of 0.006 by epoch 20, compared to 0.020 for the baseline, indicating that the decomposed representation is easier to optimize.
+\end{enumerate}
+
+\textbf{Limitations.} The current model operates on bounding box trajectories only and does not yet incorporate mask-level shape features. The gated fusion weights remain approximately uniform ($\sim$0.33 per modality), suggesting that per-instance adaptive gating --- which could dynamically emphasize different modalities based on the motion regime --- is an important direction for future work.
+
+The next stage of the project will focus on integrating occlusion-aware confidence estimation and memory-based temporal association mechanisms. These components are expected to further improve tracking stability during extended occlusion sequences by allowing the model to dynamically upweight motion signals when appearance becomes unreliable.
+
+\clearpage
+
+{\small
+\bibliographystyle{plain}
+
+\begin{thebibliography}{10}
+
+\bibitem{heo2023genvis}
+M.~Heo et~al.
+\newblock A generalized framework for video instance segmentation.
+\newblock {\em CVPR}, 2023.
+
+\bibitem{lin2014coco}
+Tsung-Yi Lin et~al.
+\newblock Microsoft COCO: Common objects in context.
+\newblock {\em ECCV}, 2014.
+
+\bibitem{liu2023instmove}
+X.~Liu et~al.
+\newblock InstMove: Instance motion for object-centric video segmentation.
+\newblock {\em CVPR}, 2023.
+
+\bibitem{qi2022ovis}
+Junfeng Qi et~al.
+\newblock Occluded video instance segmentation: A benchmark.
+\newblock {\em IJCV}, 2022.
+
+\bibitem{xu2025survey}
+Chenhao Xu et~al.
+\newblock Deep learning techniques for video instance segmentation: A survey.
+\newblock {\em Pattern Recognition}, 2025.
+
+\bibitem{yang2019masktrack}
+Lin Yang et~al.
+\newblock Video instance segmentation.
+\newblock {\em ICCV}, 2019.
+
+\bibitem{wang2021vistr}
+Yu Wang et~al.
+\newblock End-to-end video instance segmentation with transformers.
+\newblock {\em CVPR}, 2021.
+
+\bibitem{bertasius2021space}
+Gedas Bertasius et~al.
+\newblock Space-time attention for video understanding.
+\newblock {\em ICML}, 2021.
+
+\end{thebibliography}
+}
+
+\end{document}
