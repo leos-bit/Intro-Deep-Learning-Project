@@ -35,6 +35,11 @@ from multimodal_motion_model import (
     MultiModalMotionLSTM,
     build_multimodal_features,
 )
+from occlusion_aware_model import (
+    OcclusionAwareMultiModalLSTM,
+    OCC_DEFAULT,
+    _encode_occlusion,
+)
 
 
 MAP_IOU_THRESHOLDS = torch.arange(0.50, 1.0, 0.05)
@@ -213,6 +218,54 @@ def predict_multimodal_across_gap(model, pre_states, gap_length, history,
     return states[-1]
 
 
+def load_occlusion_aware(path, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = OcclusionAwareMultiModalLSTM(
+        hidden_dim=ckpt.get("hidden_dim", 64),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    norm = {k: (m.to(device), s.to(device)) for k, (m, s) in ckpt["norm_stats"].items()}
+    return model, norm, ckpt["target_mean"].to(device), ckpt["target_std"].to(device)
+
+
+def predict_occlusion_aware_across_gap(model, pre_states, gap_length, history,
+                                        norm, y_mean, y_std, device):
+    """Use the memory-augmented model to predict across the gap.
+
+    First computes a memory representation from pre-gap frames, then uses
+    the memory readout with the gap length to predict the post-gap position.
+    """
+    hist = pre_states[-history:]
+    mm_feats = build_multimodal_features(hist)
+
+    vel = torch.tensor([f[0] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    shape = torch.tensor([f[1] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    accel = torch.tensor([f[2] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    ctx = torch.tensor([f[3] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+
+    vel = (vel - norm["vel"][0]) / norm["vel"][1]
+    shape = (shape - norm["shape"][0]) / norm["shape"][1]
+    accel = (accel - norm["accel"][0]) / norm["accel"][1]
+    ctx = (ctx - norm["ctx"][0]) / norm["ctx"][1]
+
+    # Build occlusion and area ratio inputs (default: all visible, ratio 1.0)
+    T = len(mm_feats)
+    x_occ = torch.tensor([[1.0, 0.0, 0.0]] * T, dtype=torch.float32).unsqueeze(0).to(device)
+    x_ar = torch.ones(1, T, 1, dtype=torch.float32).to(device)
+
+    gap_t = torch.tensor([min(gap_length, 50)], dtype=torch.long).to(device)
+
+    with torch.no_grad():
+        memory_repr = model.get_combined_repr(vel, shape, accel, ctx, x_occ, x_ar)
+        out = model(vel, shape, accel, ctx, x_occ, x_ar,
+                    gap_lengths=gap_t, memory_repr=memory_repr)
+
+    pred = out["pred_box"] * y_std + y_mean
+    pred[:, 2:] = torch.clamp(pred[:, 2:], min=1.0)
+    return tuple(pred[0].cpu().tolist())
+
+
 # -------------------------------------------------------
 # Evaluation
 # -------------------------------------------------------
@@ -255,6 +308,7 @@ def main():
     parser.add_argument("--annotations", type=str, default="data/annotations_train.json")
     parser.add_argument("--baseline-ckpt", type=str, default="baseline_motion_lstm_ovis.pt")
     parser.add_argument("--multimodal-ckpt", type=str, default="multimodal_motion_lstm_ovis.pt")
+    parser.add_argument("--occlusion-aware-ckpt", type=str, default="occlusion_aware_motion_lstm_ovis.pt")
     parser.add_argument("--history", type=int, default=5)
     parser.add_argument("--out-dir", type=str, default="figs")
     parser.add_argument("--out-json", type=str, default="occlusion_gap_results.json")
@@ -301,6 +355,15 @@ def main():
     print("Loading multi-modal checkpoint...")
     mm_model, mm_norm, mm_ym, mm_ys = load_multimodal(args.multimodal_ckpt, device)
 
+    # Optionally load occlusion-aware model
+    oa_model = None
+    oa_ckpt_path = Path(args.occlusion_aware_ckpt)
+    if oa_ckpt_path.exists():
+        print("Loading occlusion-aware checkpoint...")
+        oa_model, oa_norm, oa_ym, oa_ys = load_occlusion_aware(args.occlusion_aware_ckpt, device)
+    else:
+        print(f"Occlusion-aware checkpoint not found at {oa_ckpt_path}, skipping")
+
     # Define all methods
     methods = {
         "Copy-Last-Frame": lambda pre, gl: predict_copy_last(pre, gl),
@@ -308,9 +371,12 @@ def main():
         "Avg. Velocity": lambda pre, gl: predict_avg_velocity(pre, gl),
         "Baseline LSTM": lambda pre, gl: predict_baseline_across_gap(
             b_model, pre, gl, args.history, b_xm, b_xs, b_ym, b_ys, device),
-        "Multi-Modal (Ours)": lambda pre, gl: predict_multimodal_across_gap(
+        "Multi-Modal": lambda pre, gl: predict_multimodal_across_gap(
             mm_model, pre, gl, args.history, mm_norm, mm_ym, mm_ys, device),
     }
+    if oa_model is not None:
+        methods["Occ-Aware (Ours)"] = lambda pre, gl: predict_occlusion_aware_across_gap(
+            oa_model, pre, gl, args.history, oa_norm, oa_ym, oa_ys, device)
 
     # Evaluate on all gaps
     all_results = {}
@@ -353,7 +419,7 @@ def main():
     method_names = list(methods.keys())
     colors = {"Copy-Last-Frame": "#9E9E9E", "Const. Velocity": "#FF9800",
               "Avg. Velocity": "#795548", "Baseline LSTM": "#2196F3",
-              "Multi-Modal (Ours)": "#E91E63"}
+              "Multi-Modal": "#E91E63", "Occ-Aware (Ours)": "#4CAF50"}
 
     # Fig 1: Overall mAP bar chart
     fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -424,12 +490,15 @@ def main():
               f"{r['IoU']:>6.3f} {r['L2']:>7.1f}")
     print("-" * 80)
 
-    # Print improvement of Multi-Modal over each baseline
-    mm = all_results["Multi-Modal (Ours)"]["overall"]
-    print("\nImprovement of Multi-Modal over each method:")
-    for mname in method_names[:-1]:
+    # Print improvement of best model over each baseline
+    best_name = "Occ-Aware (Ours)" if "Occ-Aware (Ours)" in all_results else "Multi-Modal"
+    best = all_results[best_name]["overall"]
+    print(f"\nImprovement of {best_name} over each method:")
+    for mname in method_names:
+        if mname == best_name:
+            continue
         r = all_results[mname]["overall"]
-        delta_map = mm["mAP"] - r["mAP"]
+        delta_map = best["mAP"] - r["mAP"]
         pct = (delta_map / r["mAP"]) * 100 if r["mAP"] > 0 else 0
         print(f"  vs {mname}: mAP +{delta_map:.4f} ({pct:+.1f}%)")
     print("=" * 80)

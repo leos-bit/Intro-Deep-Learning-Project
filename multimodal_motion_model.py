@@ -304,9 +304,11 @@ class ModalityEncoder(nn.Module):
             batch_first=True,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_all_timesteps: bool = False) -> torch.Tensor:
         x = torch.relu(self.proj(x))
         out, _ = self.lstm(x)
+        if return_all_timesteps:
+            return out
         return out[:, -1, :]
 
 

@@ -34,6 +34,7 @@ from multimodal_motion_model import (
     MultiModalMotionLSTM,
     build_multimodal_features,
 )
+from occlusion_aware_model import OcclusionAwareMultiModalLSTM
 
 MAP_IOU_THRESHOLDS = torch.arange(0.50, 1.0, 0.05)
 
@@ -165,6 +166,37 @@ def predict_multimodal(model, hist, norm, y_mean, y_std, device):
     return tuple(pred[0].cpu().tolist())
 
 
+def load_occlusion_aware(path, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = OcclusionAwareMultiModalLSTM(
+        hidden_dim=ckpt.get("hidden_dim", 64),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    norm = {k: (m.to(device), s.to(device)) for k, (m, s) in ckpt["norm_stats"].items()}
+    return model, norm, ckpt["target_mean"].to(device), ckpt["target_std"].to(device)
+
+
+def predict_occlusion_aware(model, hist, norm, y_mean, y_std, device):
+    mm_feats = build_multimodal_features(hist)
+    T = len(mm_feats)
+    vel = torch.tensor([f[0] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    shape = torch.tensor([f[1] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    accel = torch.tensor([f[2] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    ctx = torch.tensor([f[3] for f in mm_feats], dtype=torch.float32).unsqueeze(0).to(device)
+    vel = (vel - norm["vel"][0]) / norm["vel"][1]
+    shape = (shape - norm["shape"][0]) / norm["shape"][1]
+    accel = (accel - norm["accel"][0]) / norm["accel"][1]
+    ctx = (ctx - norm["ctx"][0]) / norm["ctx"][1]
+    x_occ = torch.tensor([[1.0, 0.0, 0.0]] * T, dtype=torch.float32).unsqueeze(0).to(device)
+    x_ar = torch.ones(1, T, 1, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        out = model(vel, shape, accel, ctx, x_occ, x_ar)
+    pred = out["pred_box"] * y_std + y_mean
+    pred[:, 2:] = torch.clamp(pred[:, 2:], min=1.0)
+    return tuple(pred[0].cpu().tolist())
+
+
 # -------------------------------------------------------
 # Evaluation
 # -------------------------------------------------------
@@ -199,6 +231,7 @@ def main():
     parser.add_argument("--annotations", type=str, default="data/annotations_train.json")
     parser.add_argument("--baseline-ckpt", type=str, default="baseline_motion_lstm_ovis.pt")
     parser.add_argument("--multimodal-ckpt", type=str, default="multimodal_motion_lstm_ovis.pt")
+    parser.add_argument("--occlusion-aware-ckpt", type=str, default="occlusion_aware_motion_lstm_ovis.pt")
     parser.add_argument("--history", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-eval", type=int, default=20000, help="Max samples per subset")
@@ -254,12 +287,23 @@ def main():
     b_model, b_xm, b_xs, b_ym, b_ys = load_baseline(args.baseline_ckpt, device)
     mm_model, mm_norm, mm_ym, mm_ys = load_multimodal(args.multimodal_ckpt, device)
 
+    oa_model = None
+    oa_ckpt_path = Path(args.occlusion_aware_ckpt)
+    if oa_ckpt_path.exists():
+        print("Loading occlusion-aware checkpoint...")
+        oa_model, oa_norm, oa_ym, oa_ys = load_occlusion_aware(args.occlusion_aware_ckpt, device)
+    else:
+        print(f"Occlusion-aware checkpoint not found at {oa_ckpt_path}, skipping")
+
     methods = {
         "Copy-Last": lambda h: predict_copy_last(h),
         "Const. Vel.": lambda h: predict_const_velocity(h),
         "Baseline LSTM": lambda h: predict_baseline(b_model, h, b_xm, b_xs, b_ym, b_ys, device),
-        "Multi-Modal\n(Ours)": lambda h: predict_multimodal(mm_model, h, mm_norm, mm_ym, mm_ys, device),
+        "Multi-Modal": lambda h: predict_multimodal(mm_model, h, mm_norm, mm_ym, mm_ys, device),
     }
+    if oa_model is not None:
+        methods["Occ-Aware (Ours)"] = lambda h: predict_occlusion_aware(
+            oa_model, h, oa_norm, oa_ym, oa_ys, device)
 
     all_results = {}
     for sname, slist in subsets.items():
@@ -287,9 +331,10 @@ def main():
     # ---- Figures ----
     out_dir = Path(args.out_dir)
     out_dir.mkdir(exist_ok=True)
-    method_list = ["Copy-Last", "Const. Vel.", "Baseline LSTM", "Multi-Modal (Ours)"]
+    method_list = list(methods.keys())
     colors = {"Copy-Last": "#9E9E9E", "Const. Vel.": "#FF9800",
-              "Baseline LSTM": "#2196F3", "Multi-Modal (Ours)": "#E91E63"}
+              "Baseline LSTM": "#2196F3", "Multi-Modal": "#E91E63",
+              "Occ-Aware (Ours)": "#4CAF50"}
 
     # Fig 1: mAP by motion subset (grouped bar chart)
     subset_labels = ["All", "Low Motion (bottom 33%)", "Medium Motion (middle 33%)",
@@ -313,20 +358,21 @@ def main():
     fig.savefig(out_dir / "motion_subset_map.png", dpi=200)
     plt.close(fig)
 
-    # Fig 2: Improvement of Multi-Modal over Copy-Last by subset
+    # Fig 2: Improvement of best model over Copy-Last by subset
+    best_name = "Occ-Aware (Ours)" if "Occ-Aware (Ours)" in method_list else "Multi-Modal"
     fig, ax = plt.subplots(figsize=(8, 4.5))
     improvements = []
     for sl in subset_labels:
-        mm_map = all_results[sl].get("Multi-Modal (Ours)", {}).get("mAP", 0)
+        best_map = all_results[sl].get(best_name, {}).get("mAP", 0)
         cl_map = all_results[sl].get("Copy-Last", {}).get("mAP", 0)
-        pct = ((mm_map - cl_map) / cl_map * 100) if cl_map > 0 else 0
+        pct = ((best_map - cl_map) / cl_map * 100) if cl_map > 0 else 0
         improvements.append(pct)
-    bar_colors = ["#E91E63" if v >= 0 else "#9E9E9E" for v in improvements]
+    bar_colors = ["#4CAF50" if v >= 0 else "#9E9E9E" for v in improvements]
     bars = ax.bar(subset_labels, improvements, color=bar_colors, alpha=0.85)
     ax.axhline(y=0, color="black", linewidth=0.5)
     ax.axhline(y=25, color="green", linewidth=1, linestyle="--", alpha=0.5, label="25% target")
     ax.set_ylabel("Improvement (%)", fontsize=11)
-    ax.set_title("Multi-Modal vs Copy-Last-Frame: % Improvement by Subset", fontsize=11, fontweight="bold")
+    ax.set_title(f"{best_name} vs Copy-Last-Frame: % Improvement by Subset", fontsize=11, fontweight="bold")
     ax.legend()
     for bar, val in zip(bars, improvements):
         ax.text(bar.get_x() + bar.get_width()/2,
