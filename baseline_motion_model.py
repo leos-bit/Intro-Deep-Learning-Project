@@ -321,6 +321,10 @@ def train_epoch(
     return total_loss / len(loader.dataset)
 
 
+# COCO-style IoU thresholds for mAP: 0.50, 0.55, ..., 0.95
+MAP_IOU_THRESHOLDS = torch.arange(0.50, 1.0, 0.05)
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -330,11 +334,13 @@ def evaluate(
     y_mean: torch.Tensor,
     y_std: torch.Tensor,
     device: torch.device,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, dict]:
+    """Returns (mse, l2, iou, mAP, per_thresh_ap)."""
     model.eval()
     mse_sum = 0.0
     l2_sum = 0.0
     iou_sum = 0.0
+    threshold_hits = torch.zeros(len(MAP_IOU_THRESHOLDS))
     n = 0
 
     for x, y_box, _y_vis in loader:
@@ -350,13 +356,20 @@ def evaluate(
         l2 = torch.sqrt(torch.sum((pred_box[:, :2] - y_box[:, :2]) ** 2, dim=1))
         iou = bbox_iou_xywh(pred_box, y_box)
 
+        iou_cpu = iou.cpu()
+        for t_idx, thresh in enumerate(MAP_IOU_THRESHOLDS):
+            threshold_hits[t_idx] += (iou_cpu >= thresh).sum().item()
+
         bs = x.size(0)
         mse_sum += mse.sum().item()
         l2_sum += l2.sum().item()
         iou_sum += iou.sum().item()
         n += bs
 
-    return mse_sum / n, l2_sum / n, iou_sum / n
+    per_thresh_ap = {f"AP@{MAP_IOU_THRESHOLDS[i]:.2f}": threshold_hits[i].item() / n
+                     for i in range(len(MAP_IOU_THRESHOLDS))}
+    mAP = (threshold_hits / n).mean().item()
+    return mse_sum / n, l2_sum / n, iou_sum / n, mAP, per_thresh_ap
 
 
 def main() -> None:
@@ -425,7 +438,13 @@ def main() -> None:
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
     model = MotionLSTMBaseline(input_dim=10, hidden_dim=128).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -437,13 +456,33 @@ def main() -> None:
     best_epoch = None
     out_path = Path(args.model_out)
     last_out_path = out_path.with_name(f"{out_path.stem}_last{out_path.suffix}")
+    history_log = []
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, x_mean, x_std, y_mean, y_std, device)
-        val_mse, val_l2, val_iou = evaluate(model, val_loader, x_mean, x_std, y_mean, y_std, device)
+        val_mse, val_l2, val_iou, val_map, per_thresh_ap = evaluate(
+            model, val_loader, x_mean, x_std, y_mean, y_std, device,
+        )
+
+        history_log.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_mse": val_mse,
+            "val_l2": val_l2,
+            "val_iou": val_iou,
+            "val_mAP": val_map,
+            **per_thresh_ap,
+        })
+
         print(
             f"Epoch {epoch:02d} | train_loss_norm={train_loss:.4f} | "
-            f"val_mse_px={val_mse:.4f} | val_center_l2_px={val_l2:.3f} | val_iou={val_iou:.3f}"
+            f"val_mse_px={val_mse:.4f} | val_center_l2_px={val_l2:.3f} | "
+            f"val_iou={val_iou:.3f} | val_mAP={val_map:.3f}"
+        )
+        print(
+            f"  AP@0.50={per_thresh_ap['AP@0.50']:.3f} "
+            f"AP@0.75={per_thresh_ap['AP@0.75']:.3f} "
+            f"AP@0.90={per_thresh_ap['AP@0.90']:.3f}"
         )
 
         if val_iou > best_val_iou:
@@ -474,6 +513,10 @@ def main() -> None:
     }
     torch.save(payload, last_out_path)
     print(f"Saved last-epoch checkpoint to {last_out_path.resolve()}")
+
+    log_path = out_path.with_suffix(".json")
+    log_path.write_text(json.dumps(history_log, indent=2))
+    print(f"Saved training log to {log_path.resolve()}")
 
 
 if __name__ == "__main__":
