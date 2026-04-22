@@ -1,4 +1,5 @@
 .venv/
 data/
 .DS_Store
-__pycache__/baseline_motion_model.cpython-312.pyc
+__pycache__/
+*.pt
